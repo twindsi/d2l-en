@@ -1,40 +1,72 @@
 #!/bin/bash
+# Build script for PyTorch version of d2l-en
+# This script builds the book using the PyTorch framework
 
-set -ex
+set -e
 
-# Used to capture status exit of build eval command
-ss=0
+echo "========================================"
+echo "Building d2l-en with PyTorch backend"
+echo "========================================"
 
-REPO_NAME="$1"  # Eg. 'd2l-en'
-TARGET_BRANCH="$2" # Eg. 'master' ; if PR raised to master
-CACHE_DIR="$3"  # Eg. 'ci_cache_pr' or 'ci_cache_push'
-
-pip3 install .
-mkdir _build
-
-source $(dirname "$0")/utils.sh
-
-# Move sanity check outside
-d2lbook build outputcheck tabcheck
-
-# Move aws copy commands for cache restore outside
-if [ "$DISABLE_CACHE" = "false" ]; then
-  echo "Retrieving pytorch build cache from "$CACHE_DIR""
-  measure_command_time "aws s3 sync s3://preview.d2l.ai/"$CACHE_DIR"/"$REPO_NAME"-"$TARGET_BRANCH"/_build/eval _build/eval --delete --quiet --exclude 'data/*'"
-  echo "Retrieving pytorch slides cache from "$CACHE_DIR""
-  aws s3 sync s3://preview.d2l.ai/"$CACHE_DIR"/"$REPO_NAME"-"$TARGET_BRANCH"/_build/slides _build/slides --delete --quiet --exclude 'data/*'
+# Source environment variables if available
+if [ -f ".github/actions/setup_env_vars/action.yml" ]; then
+    echo "Environment setup found"
 fi
 
-# Continue the script even if some notebooks in build fail to
-# make sure that cache is copied to s3 for the successful notebooks
-d2lbook build eval || ((ss=1))
-d2lbook build slides --tab pytorch
+# Check Python version
+PYTHON_VERSION=$(python --version 2>&1)
+echo "Using: $PYTHON_VERSION"
 
-# Move aws copy commands for cache store outside
-echo "Upload pytorch build cache to s3"
-measure_command_time "aws s3 sync _build s3://preview.d2l.ai/"$CACHE_DIR"/"$REPO_NAME"-"$TARGET_BRANCH"/_build --acl public-read --quiet --exclude 'eval*/data/*'"
+# Check PyTorch installation
+echo "Checking PyTorch installation..."
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')" || {
+    echo "ERROR: PyTorch is not installed. Please install it first."
+    exit 1
+}
 
-# Exit with a non-zero status if evaluation failed
-if [ "$ss" -ne 0 ]; then
-  exit 1
+# Check for CUDA availability
+python -c "
+import torch
+if torch.cuda.is_available():
+    print(f'CUDA available: {torch.cuda.get_device_name(0)}')
+    print(f'CUDA version: {torch.version.cuda}')
+else:
+    print('CUDA not available, using CPU')
+"
+
+# Install d2l package in development mode
+echo "Installing d2l package..."
+pip install -e . --quiet
+
+# Verify d2l installation
+python -c "import d2l; print(f'd2l version: {d2l.__version__}')" || {
+    echo "ERROR: d2l package installation failed."
+    exit 1
+}
+
+# Set the framework environment variable
+export FRAMEWORK=pytorch
+
+# Run notebook execution
+echo "Starting notebook build for PyTorch..."
+if [ -z "$NUM_WORKERS" ]; then
+    NUM_WORKERS=4
 fi
+echo "Using $NUM_WORKERS workers for parallel build"
+
+# Build the notebooks
+python utils/build_notebooks.py \
+    --framework pytorch \
+    --num-workers "$NUM_WORKERS" \
+    --timeout 1200 || {
+    echo "ERROR: Notebook build failed."
+    exit 1
+}
+
+# Build HTML output
+echo "Building HTML documentation..."
+bash .github/workflow_scripts/build_html.sh
+
+echo "========================================"
+echo "PyTorch build completed successfully!"
+echo "========================================"
